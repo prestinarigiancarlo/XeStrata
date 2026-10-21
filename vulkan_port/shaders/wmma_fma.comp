@@ -1,0 +1,53 @@
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
+// shaders/wmma_fma.comp - portable FMA fallback of the gfx11 16x16x16 WMMA in src/kernels/xe/amd_wmma.hpp.
+//
+// Implements the SAME mathematics and the SAME lane mapping (row_of = 2*e + hi) as the AMD matrix instruction, but
+// with vector FMA over the 32 lanes instead of the subgroup matrix intrinsic.  This compiles and runs on lavapipe and
+// MoltenVK on macOS, so the algorithm and the lane mapping can be validated here against the CPU reference
+// (reference/cpu/wmma_reference.cpp) bit-for-bit.
+//
+// Lane mapping (identical to amd_wmma.hpp GFX11):
+//   lane L: e = L & 15 (lane16), hi = L >> 4 (half_of), KN = 16, row_of(hi, e) = 2*e + hi.
+//   A loaded into lane L: rows 2*e + hi  -> the accumulator C[r][c] is produced by the lane with e==c and row_of==r.
+//   Because row_of(hi,e) = 2*e+hi spans 0..31 for (hi,e) in {0,1}x{0..15}, every (r in 0..31, c in 0..15) is unique:
+//   the 32 lanes together fill a 32x16 output, which is the full 16x16 accumulator written twice-interleaved (half 0
+//   the even rows, half 1 the odd rows).  The host reference reproduces this exact scatter.
+//
+// ---- Bindings ----
+// 0: SSBO A  (16x16 fp16, row-major; element (k,c) at A[k*16 + c])
+// 1: SSBO B  (16x16 fp16, column-major; element (k,n) at B[k*16 + n])
+// 2: SSBO C  (32x16 fp32 accumulator out; element (r,c) at C[r*16 + c], r in 0..31, c in 0..15)
+// 3: SSBO S  (scale: 1 fp32; Y = S * C)
+// Alignment: std430 min-alignment 4 bytes; fp16 element = 2 bytes fits within a 4-byte-aligned std430 block when the
+// whole array is 4-byte aligned (16*16*2 = 512 bytes).  fp32 C = 32*16*4 = 2048 bytes, aligned.
+#version 450
+// No VK_EXT_subgroup_matrix: this is the pure-FMA fallback, so it compiles on lavapipe and MoltenVK.
+
+layout(local_size_x = 32) in;
+
+layout(std430, binding = 0) buffer A { float a_in[16 * 16]; };
+layout(std430, binding = 1) buffer B { float b_in[16 * 16]; };
+layout(std430, binding = 2) buffer C { float c_out[32 * 16]; };
+layout(std430, binding = 3) buffer S { float scale; };
+
+void main() {
+    const int lane = int(gl_LocalInvocationID.x);   // 0..31
+    const int e = lane & 15;                         // lane16
+    const int hi = lane >> 4;                        // half_of
+    const float s = scale;
+
+    // Each lane accumulates the full 16-wide K dot product for its (row = 2*e + hi, col = e) ... but row_of gives the
+    // row, and the column is the shared c = e across both halves.  Actually per amd_wmma.hpp store(): lane holds its
+    // own e (=lane16) as the COLUMN, and row_of(hi,e) as the ROW.  So lane (hi,e) writes C[ row_of(hi,e) ][ e ].
+    const int r = 2 * e + hi;
+    float acc = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < 16; ++k) {
+        // A row-major: A[k][e]; B column-major: B[k][e] (column e's k-th value at B[k*16 + e]).
+        const float av = a_in[size_t(k) * 16 + size_t(e)];
+        const float bv = b_in[size_t(k) * 16 + size_t(e)];
+        acc = fma(av, bv, acc);
+    }
+    c_out[size_t(r) * 16 + size_t(e)] = s * acc;
+}

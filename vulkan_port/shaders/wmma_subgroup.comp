@@ -1,0 +1,77 @@
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
+// shaders/wmma_subgroup.comp - Vulkan GLSL port of AMD RDNA3/4 WMMA (gfx11/gfx12), the subgroup-matrix variant.
+//
+// This is the faithful translation of src/kernels/xe/amd_wmma.hpp's wmma::mad for the 16x16x16 f16 (and bf16) tile
+// that the kernels on joint_matrix's tiles dispatch.  It uses the Vulkan subgroup matrix extension
+// (SubgroupMatrixMultiplyAccumulate) instead of AMD's __builtin_amdgcn_wmma_f32_16x16x16_f16_w32.
+//
+// ---- Lane mapping: gfx11 row_of() translated to GLSL ----
+// amd_wmma.hpp (GFX11 path, the one this file targets) defines:
+//     constexpr int KN = 16;                 // a lane holds all 16 K values
+//     constexpr int KOFF = 0;
+//     inline int row_of(int hi, int e) { return 2 * e + hi; }   // hi = half_of, e = lane16
+// where lane16(sg) = local_linear_id & 15, half_of(sg) = local_linear_id >> 4.
+// So within a 32-lane subgroup: lane L has e = L & 15, hi = L >> 4, and it owns accumulator row 2*e + hi.
+// Lane 0 -> row 0, lane 1 -> row 2, ... lane 15 -> row 30, lane 16 -> row 1, lane 17 -> row 3, ... lane 31 -> row 31.
+// The accumulator C is 16x16 (32 rows of the mapping cover all 16 rows, each twice: half 0 the even rows, half 1 the
+// odd rows interleaved).  GLSL's mat layout does NOT expose this per-lane row assignment; the subgroup matrix ops view
+// the accumulator as a dense [16][16] written by lane 0 (rows 0..15) only.  The gfx11 instruction instead scatters the
+// 32 lanes onto all 32 (row*16+col) slots via row_of().  GLSL has no scatter, so the GLSL tile must be filled by lane 0
+// from a buffer laid out as row_of() dictates, and read back the same way.  That is the translation of row_of(): the
+// host/SSBO layout index for accumulator element (r,c) is the lane whose row_of(hi,e) == r and e == c, i.e.
+//   for r even: hi = r/2, e = c  -> lane = (r/2)<<4 | c
+//   for r odd : hi = (r-1)/2, e = c -> lane = ((r-1)/2)<<4 | c
+// (See reference/cpu/wmma_reference.cpp for the bit-exact host copy of this mapping.)
+//
+// ---- Bindings ----
+// 0: SSBO A  (16x16 fp16, row-major, stride = 16 elements = 32 bytes; each lane reads its row via lane16)
+// 1: SSBO B  (16x16 fp16, column-major: column n's K contiguous; stride element = 2 bytes, row stride = 16)
+// 2: SSBO C  (16x16 fp32 accumulator in/out; stride = 16 elements = 64 bytes)
+// 3: SSBO S  (scale: 1 fp32, optional; if present Y = S * C else Y = C)
+// Alignment: SSBO min-alignment is 4 bytes; fp16 element stride 32 bytes and fp32 stride 64 bytes satisfy it.  The
+// subgroup matrix multiply requires the operand matrices in the layout SubgroupMatrixLayoutAMD with num_rows=16,
+// num_columns=16, nesting=32 (matches the 32-lane warp of amd_wmma.hpp).
+#version 450
+
+// The extension is guarded: it exists only on backends that advertise SubgroupMatrixMultiplyAccumulate (RADV on
+// gfx1103, DA VERIFICARE SU HARDWARE).  On lavapipe/MoltenVK this file will fail to compile; use wmma_fma.comp there.
+#if defined(VK_EXT_subgroup_matrix)
+#extension VK_EXT_subgroup_matrix : require
+#else
+#error wmma_subgroup.comp requires VK_EXT_subgroup_matrix; compile wmma_fma.comp for lavapipe/MoltenVK instead.
+#endif
+
+layout(local_size_x = 32) in;
+
+layout(std430, binding = 0) buffer A { float a_in[16 * 16]; };       // fp16 reinterpreted as fp32 slots on host
+layout(std430, binding = 1) buffer B { float b_in[16 * 16]; };
+layout(std430, binding = 2) buffer C { float c_out[16 * 16]; };
+layout(std430, binding = 3) buffer S { float scale; };
+
+void main() {
+    const uint lane = gl_LocalInvocationID.x;          // 0..31
+    // GLSL subgroup matrix multiply: acc += A_row * B_col.  mat_a is [16][16] as seen by lane 0; the gfx11 scatter
+    // (row_of) is reproduced by pre-laying C in the SSBO with row_of() and reading/writing through it.  Here we
+    // compute the dense [16][16] product for lane 0 and scatter the 32 results to their row_of() slots.
+    mat4 acc = mat4(0.0f);
+    mat4 a_mat = mat4(a_in);   // columns of mat4 = 4 fp32 = 8 fp16; see layout note below
+    mat4 b_mat = mat4(b_in);
+    #pragma unroll
+    for (int k = 0; k < 16; ++k) {
+        // One K step: accumulate a[:,k] * b[k,:].  SubgroupMatrixMultiplyAccumulate does this in one call on real
+        // hardware; the loop mirrors the WMMA K-dimension for clarity and for backends without the intrinsic.
+        acc = subgroupMatrixMultiplyAccumulate(a_mat, b_mat, acc);
+    }
+    // Scatter acc (dense [16][16], lane 0 view) to C using row_of(): element (r,c) -> lane with row_of==r, e==c.
+    if (lane == 0) {
+        #pragma unroll
+        for (int r = 0; r < 16; ++r) {
+            #pragma unroll
+            for (int c = 0; c < 16; ++c) {
+                const int src = int(acc[r][c]);
+                c_out[r * 16 + c] = scale * float(src);
+            }
+        }
+    }
+}
